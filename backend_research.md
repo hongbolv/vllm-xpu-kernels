@@ -251,7 +251,7 @@
 **Swap 实现:**
 - 使用 `sycl::queue::memcpy` 实现异步内存拷贝
 - 支持三种方向: Device→Device, Device→Host, Host→Device
-- Host 端使用 pinned memory
+- Host 端使用 pinned memory (页锁定内存，即通过操作系统锁定在物理内存中、不会被换出到磁盘的内存区域，GPU 可以通过 DMA 直接访问，从而实现更高效的 Host↔Device 数据传输)
 
 ### 4.6 Flash Attention 内核 (`_vllm_fa2_C`)
 
@@ -273,7 +273,7 @@ Python: flash_attn_varlen_func()
 ```
 
 **Prefill vs Decode 选择逻辑:**
-- `max_seqlen_q > 1`: 使用 Chunk Prefill (多个 query token 一起处理)
+- `max_seqlen_q > 1`: 使用 Chunk Prefill (多个 query token 一起处理)。`max_seqlen_q` 表示当前 batch 中最长的 query 序列长度——在 prefill 阶段，用户输入的完整 prompt 会作为多个 query token 一次性送入模型，因此 `max_seqlen_q` 通常等于 prompt 长度；在 decode 阶段，每次只生成一个新 token，因此 `max_seqlen_q == 1`。
 - `max_seqlen_q == 1 && is_paged`: 使用 Paged Decode (单 token decode，更高效)
 - Decode 时 `is_causal` 强制为 `false`，因为 paged decode 中 `seqused_k` 已经约束了有效 KV 范围
 
