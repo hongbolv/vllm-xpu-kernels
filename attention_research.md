@@ -42,9 +42,10 @@
 - GPU 目标：Intel XPU（PVC / BMG 架构，重点支持 XE2 架构）
 - 构建工具链：CMake + setuptools + Intel oneAPI 2025.3
 - 外部依赖：
-  - PyTorch 2.10+xpu
-  - [Intel sycl-tla](https://github.com/intel/sycl-tla)（CUTLASS 的 SYCL 移植版）— 通过 CMake `FetchContent` 在构建时拉取，提供 FMHA kernel 所依赖的 GEMM 原语、Tile 调度器和 Collective 抽象
-  - [oneDNN](https://github.com/uxlfoundation/oneDNN) — 通过 git submodule 引入（`third_party/oneDNN`），用于 DNNL 后端操作
+  - **PyTorch 2.10+xpu (libtorch)** — 所有 kernel 共同依赖；提供 `torch::Tensor`、`torch::library` 注册机制、C++ 扩展加载框架
+  - **Intel oneAPI DPC++/C++ Compiler 2025.3 运行时** — 所有 kernel 共同依赖；提供 `libsycl.so`（SYCL 运行时）、`libOpenCL.so`（OpenCL 运行时）、SPIR-V translator（离线编译 AOT device code）。CMakeLists 中显式链接 `sycl` 和 `OpenCL`
+  - **[Intel sycl-tla](https://github.com/intel/sycl-tla)（CUTLASS 的 SYCL 移植版）** — 通过 CMake `FetchContent` 在构建时拉取（header-only）；被 FlashAttention v2、GDN Attention、Grouped GEMM kernel 使用，提供 GEMM 原语（`CollectiveMma`）、Tile 调度器（`TileScheduler`）和 Collective 抽象
+  - **[oneDNN](https://github.com/uxlfoundation/oneDNN)** — 通过 git submodule 引入（`third_party/oneDNN`）；被 `_xpu_C` 模块中的量化 GEMM 等操作使用（`csrc/xpu/onednn/`），attention kernel 本身不直接依赖
 
 **构建产物（4 个 C++ 扩展模块）：**
 | 模块 | 功能 |
