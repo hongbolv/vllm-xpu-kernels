@@ -57,13 +57,75 @@
       4. `dnnl_matmul_w4a8_int4()` — INT8×INT4 → FP16 矩阵乘（`int4_gemm_w4a8.h`），双重量化 (activation s8/u8 + weight u4)，per-token/per-tensor activation scale
     - 辅助 API：`dnnl::sycl_interop::make_engine()`、`dnnl::sycl_interop::make_stream()`、`dnnl::sycl_interop::make_memory()` — 用于将 PyTorch XPU device/stream/USM 指针桥接到 oneDNN 运行时（`onednn_runtime.h`）
 
-**构建产物（4 个 C++ 扩展模块）：**
-| 模块 | 功能 |
-|------|------|
-| `vllm_xpu_kernels._C` | 通用操作（activation, layernorm, cache 等） |
-| `vllm_xpu_kernels._vllm_fa2_C` | FlashAttention v2 |
-| `vllm_xpu_kernels._moe_C` | Mixture of Experts |
-| `vllm_xpu_kernels._xpu_C` | XPU 专用操作（量化 GEMM, GDN Attention, LoRA 等） |
+**构建产物（4 个 C++ 扩展模块）及其全部功能 kernel：**
+
+#### 模块 1：`vllm_xpu_kernels._C` — 通用操作（23 个 kernel）
+
+| 分类 | Kernel 函数 | 说明 | 源文件 |
+|------|-------------|------|--------|
+| **Activation** | `silu_and_mul` | SiLU × gate | `activation.cpp` |
+| | `mul_and_silu` | gate × SiLU | `activation.cpp` |
+| | `gelu_and_mul` | GELU × gate | `activation.cpp` |
+| | `gelu_tanh_and_mul` | GELU-tanh × gate | `activation.cpp` |
+| | `gelu_fast` | Fast GELU | `activation.cpp` |
+| | `gelu_new` | New GELU | `activation.cpp` |
+| | `gelu_quick` | Quick GELU | `activation.cpp` |
+| | `swigluoai_and_mul` | SwiGLU(OAI) × gate | `activation.cpp` |
+| **LayerNorm** | `rms_norm` | RMS Normalization | `layernorm.cpp` |
+| | `fused_add_rms_norm` | 融合 residual Add + RMS Norm | `layernorm.cpp` |
+| **位置编码** | `rotary_embedding` | 旋转位置编码 (RoPE) | `pos_encoding_kernels.cpp` |
+| **FP8 量化** | `static_scaled_fp8_quant` | 静态 scale FP8 量化 | `quantization/fp8/fp8_quant.cpp` |
+| | `dynamic_scaled_fp8_quant` | 动态 per-tensor FP8 量化 | `quantization/fp8/fp8_quant.cpp` |
+| | `dynamic_per_token_scaled_fp8_quant` | 动态 per-token FP8 量化 | `quantization/fp8/fp8_quant.cpp` |
+| | `per_token_group_fp8_quant` | per-token-group FP8 量化 | `quantization/fp8/fp8_quant.cpp` |
+| **KV Cache** | `reshape_and_cache` | KV cache 写入 | `cache.cpp` |
+| | `reshape_and_cache_flash` | KV cache 写入（Flash 布局） | `cache.cpp` |
+| | `concat_and_cache_mla` | MLA KV cache 拼接写入 | `cache.cpp` |
+| | `gather_cache` | cache block 聚集读取 | `cache.cpp` |
+| | `convert_fp8` | FP8 ↔ FP16/BF16/FP32 格式转换 | `cache.cpp` |
+| | `swap_blocks` | cache block 换入/换出 | `cache.cpp` |
+| **工具** | `weak_ref_tensor` | 弱引用 tensor | `tensor_utils.cpp` |
+| | `get_xpu_view_from_cpu_tensor` | CPU tensor → XPU view 映射 | `xpu_view.cpp` |
+
+#### 模块 2：`vllm_xpu_kernels._vllm_fa2_C` — FlashAttention v2（1 个 kernel）
+
+| Kernel 函数 | 说明 | 源文件 |
+|-------------|------|--------|
+| `varlen_fwd` | FlashAttention v2 variable-length forward（统一入口，内部分发 chunk prefill / paged decode） | `flash_attn/flash_api.cpp` → `xpu/attn/attn_interface.cpp` |
+
+#### 模块 3：`vllm_xpu_kernels._moe_C` — Mixture of Experts（10 个 kernel）
+
+| Kernel 函数 | 说明 | 源文件 |
+|-------------|------|--------|
+| `moe_sum` | 各专家部分结果求和 | `moe/moe_align_sum_kernels.cpp` |
+| `moe_align_block_size` | token → expert 对齐（按 block_size 整除） | `moe/moe_align_sum_kernels.cpp` |
+| `batched_moe_align_block_size` | batched 版对齐 | `moe/moe_align_sum_kernels.cpp` |
+| `moe_lora_align_block_size` | MoE + LoRA 联合对齐 | `moe/moe_align_sum_kernels.cpp` |
+| `grouped_topk` | 分组 TopK 路由选择 | `moe/grouped_topk.cpp` |
+| `fused_grouped_topk` | 融合分组 TopK 路由 | `moe/fused_grouped_topk.cpp` |
+| `topk_softmax` | TopK + Softmax 门控 | `moe/topk.cpp` |
+| `topk_sigmoid` | TopK + Sigmoid 门控 | `moe/topk.cpp` |
+| `moe_gather` | MoE 输出聚集（加权合并） | `moe/moe_gather.cpp` |
+| `fused_moe_prologue` | MoE 前序：输入量化 + token 排列 | `moe/fused_moe_prologue.cpp` |
+
+#### 模块 4：`vllm_xpu_kernels._xpu_C` — XPU 专用操作（12 个 kernel）
+
+| 分类 | Kernel 函数 | 说明 | 源文件 | 依赖 |
+|------|-------------|------|--------|------|
+| **量化 GEMM** | `fp8_gemm` | FP8×FP8 → FP16/BF16 矩阵乘 | `xpu/onednn/onednn_matmul.cpp` | oneDNN |
+| | `fp8_gemm_w8a16` | FP16/BF16×FP8 weight-only 矩阵乘 | `xpu/onednn/onednn_matmul.cpp` | oneDNN |
+| | `int4_gemm_w4a16` | FP16/BF16×INT4 矩阵乘（group quant） | `xpu/onednn/onednn_matmul.cpp` | oneDNN |
+| | `int4_gemm_w4a8` | INT8×INT4 双重量化矩阵乘 | `xpu/onednn/onednn_matmul.cpp` | oneDNN |
+| **Grouped GEMM** | `cutlass_grouped_gemm_interface` | MoE Grouped GEMM（支持 FP16/BF16/INT4/MXFP4） | `xpu/grouped_gemm/` | sycl-tla |
+| **位置编码** | `deepseek_scaling_rope` | DeepSeek 缩放旋转位置编码 | `xpu/sycl/deepseek_scaling_rope.cpp` | — |
+| **LoRA** | `bgmv_shrink` | LoRA 低秩投影（A 矩阵，shrink） | `xpu/lora/lora_shrink.cpp` | — |
+| | `bgmv_expand` | LoRA 扩展投影（B 矩阵，expand） | `xpu/lora/lora_expand.cpp` | — |
+| | `bgmv_expand_slice` | LoRA 切片扩展投影（QKV 拼接场景） | `xpu/lora/lora_expand.cpp` | — |
+| **Attention** | `gdn_attention` | Gated Delta Network 注意力 | `xpu/gdn_attn/gdn_attn_interface.cpp` | sycl-tla |
+| **设备查询** | `is_bmg` | BMG (Battlemage) 架构检测 | `xpu/utils.cpp` | — |
+| | `is_pvc` | PVC (Ponte Vecchio) 架构检测 | `xpu/utils.cpp` | — |
+
+> **合计：4 个模块，46 个注册 kernel 函数。**
 
 ---
 
