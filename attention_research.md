@@ -44,8 +44,18 @@
 - 外部依赖：
   - **PyTorch 2.10+xpu (libtorch)** — 所有 kernel 共同依赖；提供 `torch::Tensor`、`torch::library` 注册机制、C++ 扩展加载框架
   - **Intel oneAPI DPC++/C++ Compiler 2025.3 运行时** — 所有 kernel 共同依赖；提供 `libsycl.so`（SYCL 运行时）、`libOpenCL.so`（OpenCL 运行时）、SPIR-V translator（离线编译 AOT device code）。CMakeLists 中显式链接 `sycl` 和 `OpenCL`
-  - **[Intel sycl-tla](https://github.com/intel/sycl-tla)（CUTLASS 的 SYCL 移植版）** — 通过 CMake `FetchContent` 在构建时拉取（header-only）；被 FlashAttention v2、GDN Attention、Grouped GEMM kernel 使用，提供 GEMM 原语（`CollectiveMma`）、Tile 调度器（`TileScheduler`）和 Collective 抽象
-  - **[oneDNN](https://github.com/uxlfoundation/oneDNN)** — 通过 git submodule 引入（`third_party/oneDNN`）；被 `_xpu_C` 模块中的量化 GEMM 等操作使用（`csrc/xpu/onednn/`），attention kernel 本身不直接依赖
+  - **[Intel sycl-tla](https://github.com/intel/sycl-tla)（CUTLASS 的 SYCL 移植版）** — 通过 CMake `FetchContent` 在构建时拉取；header-only 库（即**不编译为独立的 .so/.a**，所有代码以 C++ 模板头文件形式 `#include` 到本项目的 kernel 源文件中，由本项目的编译器一起编译为最终的 .so）。被 FlashAttention v2（chunk prefill / paged decode）、GDN Attention、Grouped GEMM kernel 使用。sycl-tla 提供的**不是**具体的 attention kernel 实现，而是底层构建块：
+    - `cute::gemm()` / `cutlass::gemm::collective::CollectiveMma` — 子组级矩阵乘加原语，attention kernel 内部用它来执行 Q×K 和 Score×V 矩阵乘法
+    - `cutlass::fmha::kernel::XeReduceSplitKTileScheduler` 等 — Tile 调度器，负责将 Q/K 序列维度分块映射到 GPU 工作组
+    - `cutlass::fmha::collective::CollectiveEpilogue` — Epilogue 抽象，负责将 GEMM 结果写回全局内存（含 softmax rescale）
+    - `cutlass::KernelHardwareInfo` / `cutlass::get_sub_group_id()` 等 — 硬件查询与子组索引工具函数
+  - **[oneDNN](https://github.com/uxlfoundation/oneDNN)** — 通过 git submodule 引入（`third_party/oneDNN`）；被 `_xpu_C` 模块中的量化 GEMM 操作使用（`csrc/xpu/onednn/`），attention kernel 本身不直接依赖。`_xpu_C` 调用的 oneDNN 算子完整列表：
+    - **`dnnl::matmul`**（量化矩阵乘法原语）— 这是唯一使用的 oneDNN 算子类型，通过 `matmul_primitive_create_and_cache()` 创建并缓存。具体有 4 个封装函数对应 4 种量化组合：
+      1. `dnnl_matmul_w8a8_fp8()` — FP8×FP8 → FP16/BF16 矩阵乘（`fp8_gemm_w8a8.h`），支持 e5m2 和 e4m3fn 格式，per-tensor/per-token scale
+      2. `dnnl_matmul_w8a16_fp8()` — FP16/BF16×FP8 → FP16/BF16 矩阵乘（`fp8_gemm_w8a16.h`），weight-only FP8 量化，per-channel scale
+      3. `dnnl_matmul_w4a16_int4()` — FP16/BF16×INT4 → FP16/BF16 矩阵乘（`int4_gemm_w4a16.h`），支持 group quantization + asymmetric zero-point (u4)
+      4. `dnnl_matmul_w4a8_int4()` — INT8×INT4 → FP16 矩阵乘（`int4_gemm_w4a8.h`），双重量化 (activation s8/u8 + weight u4)，per-token/per-tensor activation scale
+    - 辅助 API：`dnnl::sycl_interop::make_engine()`、`dnnl::sycl_interop::make_stream()`、`dnnl::sycl_interop::make_memory()` — 用于将 PyTorch XPU device/stream/USM 指针桥接到 oneDNN 运行时（`onednn_runtime.h`）
 
 **构建产物（4 个 C++ 扩展模块）：**
 | 模块 | 功能 |
