@@ -144,6 +144,132 @@
 | **Chunk Prefill** | 处理 prefill 阶段（长序列多 token 输入） | `max_seqlen_q > 1` 或非 paged 模式 |
 | **Paged Decode** | 处理 decode 阶段（单 token 自回归生成） | `max_seqlen_q == 1` 且 paged 模式 |
 
+#### Chunk Prefill 工作原理
+
+Chunk Prefill 用于 **prefill 阶段**：用户输入一整段 prompt（多个 token），需要一次性计算所有 token 对之间的 attention。核心算法是 **分块（tiled）FlashAttention v2**，在 Intel XE2 GPU 上使用 CUTLASS SYCL（sycl-tla）的 GEMM 原语实现。
+
+**算法步骤：**
+
+```
+输入: Q [seq_q, head_dim], K [seq_k, head_dim], V [seq_k, head_dim]
+输出: O [seq_q, head_dim]
+
+1. 分块: 将 Q 按 seq_q 维度切成大小为 TileM 的块（如 128），
+         将 K/V 按 seq_k 维度切成大小为 TileN 的块（如 32/64）
+
+2. 对于每个 Q 块（Q_tile, 由一个 work group 负责）:
+   初始化: O_acc = 0, max_logit = -∞, sum_exp = 0
+
+   3. 对于每个 K 块（循环遍历 K_tile[0..K_blocks-1]）:
+      a) GEMM-1: S_tile = Q_tile × K_tile^T           (使用 cute::gemm + XE_DPAS 指令)
+         → 得到 attention score 子矩阵 [TileM, TileN]
+
+      b) Masking: 应用 causal mask / sliding window mask / 边界 mask
+         → 将无效位置设为 -∞
+
+      c) Online Softmax（分块安全 softmax）:
+         - new_max = max(old_max, scale * row_max(S_tile))
+         - rescale = exp2(old_max - new_max)
+         - S_tile = exp2(scale * S_tile - new_max)      (逐元素)
+         - sum_exp = sum_exp * rescale + row_sum(S_tile)
+         - O_acc = O_acc * rescale                       (修正之前累积的输出)
+
+      d) GEMM-2: O_acc += S_tile × V_tile               (使用 cute::gemm + XE_DPAS 指令)
+         → 累积 attention 加权的 value
+
+   4. Epilogue: O = O_acc / sum_exp                      (归一化)
+      → 写回全局内存
+```
+
+**关键设计要点：**
+- **Online Softmax**：不需要两遍扫描（先求全局 max/sum，再归一化），而是在遍历 K 块的过程中增量更新 max 和 sum，并通过 `rescale` 因子修正之前累积的 O 值。这使得整个计算只需一遍扫描。
+- **Tiling 策略**：`TileShapeQK`（如 128×64×32）的三个维度分别对应 Q 方向、K 方向、head_dim 方向的切分。head_dim 方向如果 > 32 则需要多次迭代（内循环 D）。
+- **双流水线（2 Pipeline Stages）**：在计算当前 K 块的 GEMM-1 时，同时预取下一个 K 块的数据（`prefetch_k`），隐藏内存延迟。
+- **Paged KV Cache 支持**：当 `is_paged=true` 时，K/V 不在连续内存中。通过 `block_table`（页表）将逻辑 K 块索引映射到物理页地址（`get_paged_idx()`），对 kernel 内部透明地处理内存间接寻址。
+- **GQA 支持**：多个 Q head 共享同一组 KV head，通过 `head_group_q = num_heads_q / num_heads_kv` 计算分组系数。
+- **Variable-Length Batching**：通过 `cu_seqlens_q/cu_seqlens_k`（cumulative sequence lengths）数组支持 batch 内不同长度的序列，每个序列的起始偏移动态计算。
+
+**GPU 执行模型：**
+```
+Grid: (V_tiles, Q_tiles, batch × num_heads_q)
+Block: SGPerWG × 16 threads（每个 subgroup 16 线程，共 SGPerWG 个 subgroup）
+
+每个 Work Group:
+  → 负责一个 (Q_tile, V_tile_slice, head, batch) 组合
+  → 内部遍历所有 K 块
+  → 使用 Intel XE DPAS（Dot Product Accumulate Systolic）指令做矩阵乘法
+  → 通过 Block 2D Copy 指令高效加载 Q/K/V 数据
+```
+
+#### Paged Decode 工作原理
+
+Paged Decode 用于 **decode 阶段**：自回归生成时每步只产生一个新 token，需要用这个单 token 的 query 对整个 KV cache 做 attention。由于 Q 只有 1 个 token 而 KV 可能很长（数千甚至数万），核心挑战是如何充分利用 GPU 并行度。
+
+**核心策略：Split-KV 并行**
+
+不同于 prefill 可以沿 Q 维度并行（多 token），decode 的 Q 维度只有 1，无法并行。因此采用 **Split-KV** 策略：将长 KV 序列拆成多个分片（splits），每个分片由独立的 work group 并行计算，最后通过一个 reduction kernel 合并结果。
+
+**算法步骤（Phase 1 — Split-KV Attention）：**
+
+```
+输入: Q [1, head_dim], K_cache [seq_k, head_dim] (paged), V_cache [seq_k, head_dim] (paged)
+参数: num_kv_splits = ceil(num_xe_cores / (batch × num_heads_kv))
+
+1. 将 KV 序列均匀分成 num_kv_splits 个分片:
+   split_i 负责 K 块 [start_i, end_i)
+
+2. 对于每个 split_i（由一个 work group 负责）:
+   初始化: O_acc = 0, max_logit = -∞, sum_exp = 0
+
+   3. 对于该分片内的每个 K 块:
+      a) GEMM-1: S = Q × K_block^T
+      b) Masking: 边界处理（sliding window 等）
+      c) Online Softmax: 更新 max_logit, sum_exp, O_acc（同 prefill）
+      d) GEMM-2: O_acc += S × V_block
+
+   4. Epilogue: 将 O_acc / sum_exp、sum_exp、max_logit 写入临时缓冲区
+      → tmp_out[split_i], exp_sums[split_i], max_logits[split_i]
+```
+
+**算法步骤（Phase 2 — ReduceSplitK）：**
+
+```
+输入: tmp_out[0..S-1], exp_sums[0..S-1], max_logits[0..S-1]（S = num_kv_splits）
+输出: O [1, head_dim]
+
+1. 计算全局 max:
+   global_max = max(max_logits[0], ..., max_logits[S-1])
+
+2. 加权合并:
+   O_final = 0, total_exp = 0
+   for i in 0..S-1:
+     rescale = exp2(max_logits[i] - global_max)
+     O_final += tmp_out[i] × exp_sums[i] × rescale     // 注: tmp_out 已除以 local exp_sum，先乘回来
+     total_exp += exp_sums[i] × rescale
+
+3. 归一化: O = O_final / total_exp
+```
+
+**关键设计要点：**
+- **num_kv_splits 自动调节**：`get_num_splits()` 根据 GPU 的 XE Core 数量（`slices × subslices_per_slice`）和 `batch × num_heads_kv` 的并行度自动计算，目标是让所有 XE Core 都有工作：`num_splits = ceil(xe_cores / (batch × heads_kv))`，同时受 `max_seqlen_k / block_size` 上限约束。
+- **GQA Packing**：在 decode 中，同一 KV head 对应的多个 Q head（head_group_q 个）被打包在同一个 work group 内处理。Q 的 shape 变为 `[head_group_q, head_dim]`，一次 GEMM 同时计算多个 Q head 的 attention score。这避免了为每个 Q head 重复加载 K/V 数据。
+- **Causal Mask 强制关闭**：decode 阶段每次只有 1 个 query token，KV cache 中只有历史 token（由 `seqused_k` 限定），不存在"未来"token 需要 mask。如果启用 causal mask 反而会引入错误的偏移计算。
+- **单流水线（1 Pipeline Stage）**：decode 的每个分片处理的 K 块数相对较少，双流水线收益不大，使用 1 stage 减少寄存器压力。
+- **Paged KV Cache**：decode 必须使用 paged KV cache（KV 数据分布在不连续的物理页上）。每个 K 块通过页表（`block_table`）查找实际物理地址。
+- **两阶段执行**：Phase 1（Split-KV Attention）和 Phase 2（ReduceSplitK）是两个独立的 SYCL kernel，通过 `EventManager` 管理的 SYCL event 隐式同步。当 `num_kv_splits == 1` 时跳过 Phase 2，直接输出。
+
+**GPU 执行模型：**
+```
+Phase 1 Grid: (V_tiles, Q_tiles, batch × num_heads_kv × num_kv_splits)
+  → Z 维度按 (batch, head_kv, split_idx) 三维展开
+  → 每个 Work Group: 负责一个 (batch, kv_head, split) 组合
+  → 内部展开 head_group_q 个 Q head
+
+Phase 2 Grid: (1, seq_len_qo, batch × num_heads_q)
+  → 每个 Work Group: 负责一个 (batch, q_head, seq_pos) 组合
+  → 遍历所有 splits 做 reduce
+```
+
 ### 2.2 GDN Attention（Gated Delta Network Attention）
 
 用于 Mamba/SSM 类模型架构（如 Qwen-Next），是一种线性复杂度的 attention 替代方案。
