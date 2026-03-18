@@ -244,7 +244,7 @@ Paged Decode 用于 **decode 阶段**：自回归生成时每步只产生一个�
    O_final = 0, total_exp = 0
    for i in 0..S-1:
      rescale = exp2(max_logits[i] - global_max)
-     O_final += tmp_out[i] × exp_sums[i] × rescale     // 注: tmp_out 已除以 local exp_sum，先乘回来
+     O_final += tmp_out[i] × exp_sums[i] × rescale     // tmp_out 在 Phase 1 epilogue 中已归一化（÷ local_exp_sum），此处乘回 exp_sums[i] 恢复未归一化值再参与全局合并
      total_exp += exp_sums[i] × rescale
 
 3. 归一化: O = O_final / total_exp
@@ -253,7 +253,7 @@ Paged Decode 用于 **decode 阶段**：自回归生成时每步只产生一个�
 **关键设计要点：**
 - **num_kv_splits 自动调节**：`get_num_splits()` 根据 GPU 的 XE Core 数量（`slices × subslices_per_slice`）和 `batch × num_heads_kv` 的并行度自动计算，目标是让所有 XE Core 都有工作：`num_splits = ceil(xe_cores / (batch × heads_kv))`，同时受 `max_seqlen_k / block_size` 上限约束。
 - **GQA Packing**：在 decode 中，同一 KV head 对应的多个 Q head（head_group_q 个）被打包在同一个 work group 内处理。Q 的 shape 变为 `[head_group_q, head_dim]`，一次 GEMM 同时计算多个 Q head 的 attention score。这避免了为每个 Q head 重复加载 K/V 数据。
-- **Causal Mask 强制关闭**：decode 阶段每次只有 1 个 query token，KV cache 中只有历史 token（由 `seqused_k` 限定），不存在"未来"token 需要 mask。如果启用 causal mask 反而会引入错误的偏移计算。
+- **Causal Mask 强制关闭**：decode 阶段 query 位于位置 t，KV cache 仅包含位置 0 到 t-1 的历史 token（由 `seqused_k` 限定有效长度），不存在位置 ≥ t 的"未来"token，因此 causal masking 是多余的。代码中显式传入 `is_causal=false`，因为如果错误地启用会触发一个 seq_len 偏移公式，导致读取无效 KV cache 条目。
 - **单流水线（1 Pipeline Stage）**：decode 的每个分片处理的 K 块数相对较少，双流水线收益不大，使用 1 stage 减少寄存器压力。
 - **Paged KV Cache**：decode 必须使用 paged KV cache（KV 数据分布在不连续的物理页上）。每个 K 块通过页表（`block_table`）查找实际物理地址。
 - **两阶段执行**：Phase 1（Split-KV Attention）和 Phase 2（ReduceSplitK）是两个独立的 SYCL kernel，通过 `EventManager` 管理的 SYCL event 隐式同步。当 `num_kv_splits == 1` 时跳过 Phase 2，直接输出。
